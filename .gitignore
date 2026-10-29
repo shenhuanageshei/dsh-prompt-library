@@ -1,0 +1,8 @@
+node_modules/
+lib.v0.1.bak/
+docs/
+preview/
+.artifacts/
+*.log
+*.tsbuildinfo
+.DS_Store

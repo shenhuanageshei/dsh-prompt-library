@@ -1,0 +1,4 @@
+# dsh-prompt-library bundle: host half (library file + session layers + RPC) and client half (/, dialog, chips, settings).
+- insert:
+    - id: dsh-prompt-library
+      name: dsh-prompt-library

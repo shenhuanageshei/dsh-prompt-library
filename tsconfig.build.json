@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "lib",
+    "rootDir": "src",
+    "declaration": false,
+    "sourceMap": false
+  },
+  "include": [
+    "src/index.ts",
+    "src/contract.ts",
+    "src/shared/**/*.ts",
+    "src/host/**/*.ts"
+  ]
+}

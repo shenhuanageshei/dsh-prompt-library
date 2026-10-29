@@ -1,0 +1,15 @@
+{
+  "name": "dsh-prompt-library",
+  "description": "Prompt library: `/` picker, edit-then-insert, and up to three session-scoped system-prompt layers",
+  "version": "0.1.0",
+  "entry": {
+    "name": "dsh-prompt-library",
+    "inject": [
+      "typert",
+      "systemPrompt"
+    ]
+  },
+  "client": {
+    "platform": "web"
+  }
+}
