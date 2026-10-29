@@ -49,8 +49,9 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
 import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { loadZod } from './_zod.mjs';
@@ -570,6 +571,61 @@ test('service: addLayer rejects malformed input with input-invalid', async (t) =
   assert.equal((await service.layers('s1')).layers.length, 0);
 });
 
+/** A session-layer store stub: every load reports the same outcome. */
+function layerStoreStub(outcome, write = async () => ({ stamp: { stub: true } })) {
+  return { load: () => outcome, write };
+}
+
+test('service: an unreadable layer file refuses the write with layer-read-failed (AC-13)', async () => {
+  const registry = new LayerRegistry({
+    contract,
+    store: layerStoreStub({ rows: [], stamp: null, readOnly: false, needsPromotion: false, failed: true })
+  });
+  const service = new PromptLibraryService({}, { store: failingStore(new Error('unused')), layers: registry, contract });
+  await assert.rejects(
+    service.addLayer('s1', { promptId: 'p_1', title: 't', body: 'b' }),
+    wireError('layer-read-failed')
+  );
+  assert.deepEqual((await service.layers('s1')).layers, [], 'the read side still answers an empty snapshot');
+});
+
+test('service: a layer file written by a newer version maps to layer-readonly', async () => {
+  const registry = new LayerRegistry({
+    contract,
+    store: layerStoreStub({ rows: [], stamp: { newer: true }, readOnly: true, needsPromotion: false })
+  });
+  const service = new PromptLibraryService({}, { store: failingStore(new Error('unused')), layers: registry, contract });
+  await assert.rejects(service.addLayer('s1', { promptId: 'p_1', title: 't', body: 'b' }), wireError('layer-readonly'));
+});
+
+test('service: removeLayer and clearLayers map persistence failures to wire errors', async () => {
+  const denial = () => Promise.reject(Object.assign(new Error('the session layer file could not be read'), { code: 'layer-read-failed' }));
+  const registry = { remove: denial, clear: denial };
+  const service = new PromptLibraryService({}, { store: failingStore(new Error('unused')), layers: registry, contract });
+  await assert.rejects(service.removeLayer('s1', 'p_1'), wireError('layer-read-failed'));
+  await assert.rejects(service.clearLayers('s1'), wireError('layer-read-failed'));
+});
+
+test('service: the layers RPC answers an empty snapshot even when the registry throws', async () => {
+  const original = console.error;
+  const logged = [];
+  console.error = (...args) => logged.push(args);
+  try {
+    const registry = {
+      snapshot() {
+        throw new Error('registry exploded');
+      }
+    };
+    const service = new PromptLibraryService({}, { store: failingStore(new Error('unused')), layers: registry, contract });
+    const snapshot = await service.layers('s1');
+    assert.deepEqual({ ...snapshot }, { layers: [], totalTokens: 0, limit: contract.LIMITS.layers });
+    assert.equal(contract.layerSnapshotSchema.safeParse(snapshot).success, true);
+    assert.equal(logged.length, 1);
+  } finally {
+    console.error = original;
+  }
+});
+
 // --------------------------------------------------------------- markers ----
 
 test('service: markRemoteMethods installs the eight direct markers on the prototype', async (t) => {
@@ -744,6 +800,7 @@ const indexModule = await (async () => {
       './contract.js': libUrl('contract.js'),
       './host/store.js': libUrl('host', 'store.js'),
       './host/layers.js': libUrl('host', 'layers.js'),
+      './host/layer-store.js': libUrl('host', 'layer-store.js'),
       './host/service.js': serviceStubUrl,
       './host/typert.js': libUrl('host', 'typert.js')
     });
@@ -752,6 +809,50 @@ const indexModule = await (async () => {
   }
 })();
 const { SECTION_NAME, SECTION_ORDER_FALLBACK, SECTION_ORDER_OFFSET, apply, inject, name, resolveSectionOrder } = indexModule;
+
+/**
+ * Directory entry names, or [] when the directory does not exist.
+ * @param {string} dir - absolute directory.
+ * @returns {Promise<string[]>} sorted names.
+ */
+async function listNames(dir) {
+  try {
+    return (await readdir(dir)).sort();
+  } catch (error) {
+    if (error !== null && typeof error === 'object' && error.code === 'ENOENT') return [];
+    throw error;
+  }
+}
+
+/**
+ * Redirect DSH_HOME to a throwaway directory for one index-wiring test (A1).
+ *
+ * `apply(ctx)` resolves BOTH stores from `process.env` at call time
+ * (`resolveLibraryPath(process.env, homedir())` for the library and
+ * `new LayerStore()` for the session layers), so redirecting `DSH_HOME` before
+ * the call keeps the test hermetic and restoring it in `t.after` keeps the rest
+ * of the run untouched. Without this the wiring tests wrote their throwaway
+ * session layers ("s1") into the real `~/.dsh/prompt-library/sessions/`
+ * directory — the 0.2 round left an `s1.json` there (created 22:57).
+ * @param {object} t - the node:test context.
+ * @returns {Promise<{home: string, realHome: string, restore: () => void}>} the temp home, the real one and a restore hook.
+ */
+async function tempDshHome(t) {
+  const home = await mkdtemp(join(tmpdir(), 'dsh-prompt-library-index-'));
+  const previous = process.env.DSH_HOME;
+  const configured = typeof previous === 'string' ? previous.trim() : '';
+  const realHome = configured === '' ? join(homedir(), '.dsh') : configured;
+  process.env.DSH_HOME = home;
+  const restore = () => {
+    if (previous === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = previous;
+  };
+  t.after(async () => {
+    restore();
+    await rm(home, { recursive: true, force: true });
+  });
+  return { home, realHome, restore };
+}
 
 /** A stub cordis root context that records what apply() wires. */
 function makeCtx(overrides = {}) {
@@ -800,7 +901,8 @@ test('index: resolveSectionOrder falls back when the platform cannot answer', ()
   assert.equal(resolveSectionOrder({ getSectionOrder: () => '10200' }), 10500);
 });
 
-test('index: apply registers the manifest and the section, and no agent-teardown clear', () => {
+test('index: apply registers the manifest and the section, and no agent-teardown clear', async (t) => {
+  const { home } = await tempDshHome(t);
   const { ctx, state } = makeCtx();
   const before = serviceStub.PromptLibraryService.instances.length;
   apply(ctx);
@@ -830,10 +932,33 @@ test('index: apply registers the manifest and the section, and no agent-teardown
   assert.equal(service.ctx, ctx);
   assert.equal(service.contract.LIMITS.layers, 3);
   assert.equal(service.libraryPath, service.store.filePath);
-  assert.match(service.store.filePath, /prompt-library[\\/]prompts\.json$/u);
+  assert.equal(service.store.filePath, join(home, 'prompt-library', 'prompts.json'), 'the library follows the injected DSH_HOME');
 });
 
-test('index: the section text reads the live layer registry and a disposed agent keeps it', () => {
+test('index: apply writes session layers under the injected DSH_HOME, never the real one (A1 regression)', async (t) => {
+  const { home, realHome } = await tempDshHome(t);
+  const realSessions = join(realHome, 'prompt-library', 'sessions');
+  const before = await listNames(realSessions);
+
+  const { ctx, state } = makeCtx();
+  apply(ctx);
+  const section = state.sections[0];
+  const service = serviceStub.PromptLibraryService.instances.at(-1);
+  await service.layers.add('s1', { promptId: 'p_1', title: 'one', body: 'first body' });
+  assert.equal(section.text({ agent: { session: { id: 's1' } } }), 'first body');
+
+  // The session layer file landed in the temp DSH_HOME: both stores followed it.
+  const redirected = join(home, 'prompt-library', 'sessions', 's1.json');
+  assert.equal(existsSync(redirected), true, 'the session layer write follows the injected DSH_HOME');
+
+  // ...and the real profile directory has exactly the same entries as before.
+  const after = await listNames(realSessions);
+  assert.deepEqual(after, before, 'a test must never write the real DSH home (A1: the leak was s1.json)');
+  assert.equal(after.includes('s1.json'), false, 'the leaked test artifact never comes back');
+});
+
+test('index: the section text reads the live layer registry and a disposed agent keeps it', async (t) => {
+  await tempDshHome(t);
   const { ctx, state } = makeCtx();
   apply(ctx);
   const section = state.sections[0];
@@ -848,7 +973,7 @@ test('index: the section text reads the live layer registry and a disposed agent
   assert.equal(section.text({ agent: null }), '');
   assert.equal(section.text({ agent: {} }), '');
   assert.equal(section.text({ agent: { session: { id: 's1' } } }), '', 'no layer means an empty section (AC-11)');
-  service.layers.add('s1', { promptId: 'p_1', title: 'one', body: 'first body' });
+  await service.layers.add('s1', { promptId: 'p_1', title: 'one', body: 'first body' });
   assert.equal(section.text({ agent: { session: { id: 's1' } } }), 'first body');
   assert.equal(section.text({ agent: { session: { id: 's2' } } }), '', 'another session pays nothing');
   // Regression, live acceptance finding 1: the agent is disposed between two
@@ -863,7 +988,8 @@ test('index: the section text reads the live layer registry and a disposed agent
   assert.equal(section.text({ agent: { session: { id: 's1' } } }), 'first body', 'malformed teardown payloads change nothing either');
 });
 
-test('index: layers survive the per-turn agent recreation that emptied them in the live session (finding 1)', () => {
+test('index: layers survive the per-turn agent recreation that emptied them in the live session (finding 1)', async (t) => {
+  await tempDshHome(t);
   const { ctx, state } = makeCtx();
   apply(ctx);
   const section = state.sections[0];
@@ -874,8 +1000,8 @@ test('index: layers survive the per-turn agent recreation that emptied them in t
   };
   const assemble = (sessionId) => section.text({ agent: { session: { id: sessionId } } });
 
-  const first = service.layers.add('s1', { promptId: 'p_1', title: 'one', body: 'say it plainly' });
-  service.layers.add('s1', { promptId: 'p_2', title: 'two', body: 'keep going' });
+  const first = await service.layers.add('s1', { promptId: 'p_1', title: 'one', body: 'say it plainly' });
+  await service.layers.add('s1', { promptId: 'p_2', title: 'two', body: 'keep going' });
   const both = 'say it plainly' + '\n\n---\n\n' + 'keep going';
   assert.equal(assemble('s1'), both, 'step 1 carries both layers');
 
@@ -898,14 +1024,15 @@ test('index: layers survive the per-turn agent recreation that emptied them in t
 
   // The only non-restart clear paths left are the user's own: removing a layer
   // (chip x) or the explicit clearLayers RPC.
-  service.layers.remove('s1', 'p_1');
+  await service.layers.remove('s1', 'p_1');
   assert.equal(assemble('s1'), 'keep going');
-  service.layers.clear('s1');
+  await service.layers.clear('s1');
   assert.equal(assemble('s1'), '');
   assert.equal(first.layers.length, 1, 'a snapshot taken at step 1 is a value, not the live row array');
 });
 
-test('index: the manifest effect disposes the strict registration', () => {
+test('index: the manifest effect disposes the strict registration', async (t) => {
+  await tempDshHome(t);
   const { ctx, state } = makeCtx();
   apply(ctx);
   assert.equal(state.disposed, 0);
@@ -913,7 +1040,8 @@ test('index: the manifest effect disposes the strict registration', () => {
   assert.equal(state.disposed, 1);
 });
 
-test('index: a rejected strict manifest is logged and the plugin still registers the section', () => {
+test('index: a rejected strict manifest is logged and the plugin still registers the section', async (t) => {
+  await tempDshHome(t);
   const original = console.error;
   const logged = [];
   console.error = (...args) => logged.push(args);

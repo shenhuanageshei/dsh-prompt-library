@@ -4,7 +4,8 @@
  * The client half is TypeScript (`src/client/*.ts`) and ships as the tsdown
  * bundle, but the client unit tests still assemble individual modules in one
  * plain VM scope: the helpers they exercise (`planInsert`, `importOutcome`,
- * `visiblePrompts`, `layerWarmupKept`, ...) are module-private, so a real ESM
+ * `visiblePrompts`, `ensureLayers` / the `layersReady` hydration set, ...) are
+ * module-private, so a real ESM
  * import cannot reach them. Each file is therefore transpiled with the repo's
  * installed `typescript` package — `module: ESNext`, `target: ES2022` keeps the
  * source's own module shape, no CommonJS shim is emitted — and then flattened

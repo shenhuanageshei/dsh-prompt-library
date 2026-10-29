@@ -5,9 +5,14 @@
  *
  * One chip per layer, a × per chip, and one trailing total. Rendered only while
  * the session actually holds a layer, so an untouched session shows nothing.
+ *
+ * 0.2 (design §5.6 / FR-4): the strip asks for its own session's layers when it
+ * mounts, instead of waiting for a session-list change. A browser refresh
+ * therefore brings the chips back on its own; the old list sweep stays only as
+ * a pre-warm of other sessions.
  */
 
-import { React } from './react.js';
+import { React, useEffect } from './react.js';
 
 /**
  * The dock entry.
@@ -16,6 +21,13 @@ import { React } from './react.js';
  */
 export function LayersDock(props) {
   const snapshot = props.useLayers((value) => value);
+  // Mount-time hydration. `ensure` is idempotent (it reuses an in-flight read and
+  // skips a session that already succeeded) and never throws into render
+  // (design §5.6), so this effect is safe on every mount/session switch.
+  const ensure = props.ensure;
+  useEffect(() => {
+    if (typeof ensure === 'function') ensure();
+  }, [props.sessionId]);
   const layers = Array.isArray(snapshot?.layers) ? snapshot.layers : [];
   if (layers.length === 0) return null;
   const total = Number.isFinite(snapshot?.totalTokens) ? snapshot.totalTokens : 0;

@@ -117,7 +117,8 @@
 
 ### D10 读失败：零副作用、先试备份、再按无文件回退（选定）
 
-- 读路径只 stat/read/parse，不写盘、不改名、不清理、不修备份；任何异常都在读层内吞掉。
+- 读路径只 lstat/read/parse，不写盘、不改名、不清理、不修备份；任何异常都在读层内吞掉。
+- 与 AC-8 的统一口径：**读路径本身不写；读取返回 needsPromotion，注册表随后用串行写任务异步搬入，这是显式写，不是读路径写**。
 - 候选顺序：主文件 → 备份 → 兜底文件；第一个可读且合法的就用；都失败才按“没有这个文件”返回空。
 - 备份恢复多一次小文件读取；备份也受 1 MiB 上限；用主/备/兜底的 stamp 组合缓存，文件都没变就不重复解析。
 - 失败即“没有这个文件”：标签空、注入空；不把异常抛给系统提示词组装或界面 RPC。
@@ -230,12 +231,14 @@ interface LayerStore {
 }
 ~~~
 
-- load 是同步的，因为系统提示词组装只能同步读；**永不抛错**：任何 stat/read/parse/大小/字段异常都返回空。读路径不写盘、不改名。
+- load 是同步的，因为系统提示词组装只能同步读；**永不抛错**：任何 lstat/read/parse/大小/字段异常都返回空。读路径不写盘、不改名。
 - 候选顺序：主文件 → 备份 → 兜底文件；第一个可读且合法的就用；都失败才按无文件。备份可读时自动恢复。
+- FileStamp 的 `{error:'absent'}` 语义：缺失候选记 `{path, error:'absent'}`；`null` 只表示该候选不在候选集（没有会话目录）。这样“文件/会话目录出现”是一次 stamp 变化，AC-8 的搬入不依赖用户写入；缺失永远不算 I/O 错误。
 - 复合 stamp：主/备/兜底各自的 (路径, mtime, size) 或 stat 错误标记；三个都没变就不解析。备份恢复因此不会每次组装都重读。
 - 每个候选超过 MAX_FILE_BYTES 都不读取、不解析；有效文件远小于 1 MiB。
 - write 是异步的；失败抛错，注册表不提交内存；写前只复制能解析的主文件到备份，坏文件不覆盖备份。
 - store 未注入时，注册表退化为 0.1 的纯内存行为（单测/兼容）；生产路径始终注入。
+- 日志（需求 §5 可观测）：定位命中多个重复会话目录、写时会话目录消失回退兜底、写失败映射 layer-persist 之前，都记 host 日志（session id / 路径 / 错误码或消息，绝不记正文或密钥）。
 - 定位、路径拼装、大小检查、备份写入、.tmp 清理都在存储模块内部，注册表只依赖上面的三个方法。
 
 ### 5.1 路径与目录定位
@@ -258,18 +261,23 @@ function locateSessionDir(sessionId) {
   let projects;
   try { projects = readdirSync(sessionsRoot, { withFileTypes: true }); }
   catch { return null; }
+  const matches = [];
   for (const project of projects) {
     if (!project.isDirectory()) continue;
     const candidate = join(sessionsRoot, project.name, sessionId);
-    if (isDirectory(candidate)) { dirCache.set(sessionId, candidate); return candidate; }
+    if (isDirectory(candidate)) matches.push(candidate);
   }
-  return null;
+  if (matches.length === 0) return null;
+  if (matches.length > 1) logOnce('duplicate-session-dir', sessionId, matches);
+  dirCache.set(sessionId, matches[0]);
+  return matches[0];
 }
 ~~~
 
 - 前条件：sessionId 是字符串；sessionsRoot 可不存在。
 - 后条件：返回绝对目录或 null；不创建目录；缓存只缓存正结果，目录消失会重新扫。
 - 真实会话 id 是 session-加 uuid，形状符合白名单。平台对特殊字符会做路径编码；本插件只接受白名单内的 id，避免复刻平台的编码器。若未来平台发出白名单外的 id，加层会报 session-invalid，读返回空（见 §9）。
+- 同一 sessionId 命中多个项目目录时取第一个并记一次日志（session id + 全部候选路径，不记正文；平台自身会报重复，本插件不扩大问题，见 §9）。
 - 负结果不缓存：会话目录出现前，每次定位会重扫 sessions 根的项目目录（数量有限；见 §11 预算）。
 
 ### 5.2 读取与校验
@@ -292,15 +300,19 @@ function load(sessionId, previousStamp) {
   const infos = new Map();
   const errors = new Set();
 
-  // 先 stat 全部候选，组成复合 stamp（文件或错误标记）；没变就直接用内存
+  // 先 lstat 全部候选，组成复合 stamp（文件或错误标记）；没变就直接用内存
   for (const c of candidates) {
     try {
-      const info = statSync(c.path, { throwIfNoEntry: false });
+      const info = lstatSync(c.path);   // lstat：能识别目录/符号链接等非普通文件
       if (info) {
         infos.set(c.key, info);
         stamp[c.key] = { path: c.path, mtimeMs: info.mtimeMs, size: info.size };
       }
     } catch (error) {
+      if (error.code === 'ENOENT' || error.code === 'ENOTDIR') {
+        stamp[c.key] = { path: c.path, error: 'absent' };   // 缺失不是 I/O 错误（AC-8）
+        continue;
+      }
       errors.add(c.key);
       stamp[c.key] = { path: c.path, error: 'stat-failed' };
       logOnce('layer-stat-failed', c.path, error);
@@ -344,7 +356,7 @@ function load(sessionId, previousStamp) {
 - 前条件：previousStamp 可能是 null。
 - 后条件：rows 最多 limit 条，顺序保留，token 重算；**永不抛错**；所有候选都不可用才按无文件；不写盘、不改名。
 - 候选顺序：主文件 → 备份 → 兜底文件；第一个可读且合法的就用；备份可读时自动恢复；都失败才空。
-- 复合 stamp：先 stat 三个候选；文件记 (路径, mtimeMs, size)，stat 异常记错误标记；三个都没变就直接返回 unchanged。命中之后的 I/O 错误不阻止缓存；命中之前的 I/O 错误把 stamp 置空，下次重试；非命中候选长期不可读时仍只 stat。
+- 复合 stamp：先 lstat 三个候选（lstat 才能识别非普通文件）；文件记 (路径, mtimeMs, size)，异常记错误标记；三个都没变就直接返回 unchanged。命中之后的 I/O 错误不阻止缓存；命中之前的 I/O 错误把 stamp 置空，下次重试；非命中候选长期不可读时仍只 stat。
 - 单候选失败（坏/超大/不是普通文件/读异常）不打断，继续试下一个；只要出现过 I/O 错误且没有可用命中，就返回 failed（I/O 优先，注册表 30 秒退避）；内容类覆盖只在没有任何 I/O 错误时允许。
 - 解析规则：
   - 根必须是对象；version 必须是整数。
@@ -353,7 +365,7 @@ function load(sessionId, previousStamp) {
   - layers 必须是数组，长度不超过 limit。
   - 每行：promptId 非空字符串；title 非空且不超过标题上限；body 非空且不超过正文上限；同一 promptId 不允许重复。
   - 忽略未知字段；tokens 不读文件里的值，统一重算。
-- 大小/类型：每个候选先 stat；不是普通文件、超过 1 MiB 都跳过，继续试下一个。
+- 大小/类型：每个候选先 lstat（与 §5.2 伪代码一致；lstat 才能识别目录/符号链接等非普通文件）；不是普通文件、超过 1 MiB 都跳过，继续试下一个。
 - 缓存：复合 stamp 缓存；坏文件/超大文件/错误标记都记 stamp，文件不变不重试；只要出现过 I/O 错误且无命中才返回 failed。
 
 ### 5.3 写入与备份
@@ -465,7 +477,11 @@ class LayerRegistry {
   async #persist(sessionId, rows) {
     if (!this.#store) return null; // 单测/兼容：纯内存
     try { return await this.#store.write(sessionId, rows); }
-    catch (error) { throw layerError('layer-persist', error); }
+    catch (error) {
+      // 可观测（需求 §5）：映射成 layer-persist 之前先记 session id、错误码/消息；不记正文。
+      console.error('[dsh-prompt-library] layer persist failed', sessionId, error.code ?? error.message);
+      throw layerError('layer-persist', error);
+    }
   }
 
   async add(sessionId, input) {
@@ -535,11 +551,12 @@ class LayerRegistry {
 
 - 确保加载是同步的：系统提示词组装只能在同步回调里读，不能等 Promise。
 - 读异常（I/O 类）且所有候选都不可用：清空该会话内存层（按无文件）、记日志、30 秒退避；**不保留旧值**；加/删层拒绝写入。有可读备份/兜底就按副本继续。内容类失败不置 failed；加/删层允许写新文件覆盖坏主文件。
-- 搬入：schedulePromotion 把任务放进同一个串行队列；任务里重新 ensureLoaded（此时用兜底数据）、写会话主文件、删兜底；失败保留兜底并记日志；同一会话 30 秒内不重复尝试。
+- 搬入：schedulePromotion 把任务放进同一个串行队列；任务里重新 ensureLoaded（此时用兜底数据）、写会话主文件、删兜底；失败保留兜底并记日志；同一会话 30 秒内不重复尝试。**读路径本身不写；读取返回 needsPromotion，注册表随后用串行写任务异步搬入，这是显式写，不是读路径写。**
 - 空状态：remove 删掉最后一条、clear 都会写空文件；不是删主文件（见 D5）。
 - 读不阻塞：所有磁盘操作都是小文件同步读写；不做全量扫描。
 - 读异常/解析异常都在这里被吞掉；注册表向系统提示词和 RPC 只返回空，不抛错；I/O 错误 30 秒退避。
 - store 为空时（单测或无持久化构造），ensureLoaded 直接返回，add/remove/clear 跳过写盘，行为与 0.1 内存注册表一致。
+- 可观测（需求 §5）：写失败在映射成 layer-persist 之前记 host 日志（session id、底层错误码/消息，不记正文/密钥）。
 - add 前条件：sessionId 合法、input 字段合法、同 id 不新增行；后条件：文件成功、rows 已提交、返回快照；失败码 layer-limit / layer-persist / layer-readonly。
 - remove 前条件：无；后条件：幂等，未命中不写盘，命中后写盘并提交。
 - clear 前条件：无；后条件：写空状态并提交；已经没有层时不写盘。
@@ -759,7 +776,7 @@ sequenceDiagram
 | AC-5 文件归属 | tests/layer-store.test.mjs：把会话目录整体复制到别处再复制回来 | 单测 |
 | AC-6 读失败回退 | tests/layer-store.test.mjs：坏主文件+好备份→备份；备份/兜底都不可用→空；不改名、不写盘 | 单测 |
 | AC-7 写失败 | tests/layers.test.mjs：假存储抛错，注册表不提交 | 单测 |
-| AC-8 空会话兜底 | tests/layer-store.test.mjs：无会话目录写兜底文件（不是 .tmp）；目录出现后搬入 | 单测 |
+| AC-8 空会话兜底 | tests/layer-store.test.mjs：无会话目录写兜底文件（不是 .tmp）；目录出现后读取返回 needsPromotion；tests/layers.test.mjs：注册表端到端搬入（会话目录出现 → 串行写任务 → 兜底删除） | 单测 |
 | AC-9 非法编号 | tests/layer-store.test.mjs：斜杠、双点、空格 | 单测 |
 | AC-10 零 token | tests/layers.test.mjs：sectionText 空串 | 单测 |
 | AC-11 上限 | tests/layers.test.mjs：第 4 条 layer-limit | 单测 |
@@ -769,7 +786,10 @@ sequenceDiagram
 
 ### 8.2 负向断言
 
-- 读操作全程不写盘（坏文件不改名、不清理、不修备份）；测试用只读目录/写计数验证。
+- 读操作全程不写盘（坏文件不改名、不清理、不修备份）；测试用写计数/fs seam 断言验证（tests/layer-store.test.mjs 的 `io` seam 写计数器必须保持 0，不是只比较文件内容相等）。
+- 1 MiB 边界：恰好 1 MiB 的文件可读可解析；超过 1 MiB（哪怕只多 1 字节）不读取、不解析、按内容类失败处理（M4）。
+- 读取中被删：stat 成功、read 抛 ENOENT 时按 I/O 类处理（跳过该候选；有可读副本就用副本；无副本 `failed:true` 且 stamp 置空重试），绝不抛出（M5）。
+- 并发：注册表的每次写都在同一个串行队列里，同一时刻最多一个 store.write 在飞；并发 add/remove/clear 之后文件始终是完整 JSON、目录里没有 .tmp（A8 并发用例）。
 - 读失败不抛错：用抛错的假存储、坏文件、超大文件验证 sectionText 返回空串、snapshot 返回空快照。
 - 超过 1 MiB 的候选不被读取解析；其他候选可读时用其他候选。
 - 坏主文件+好备份时用备份；复合 stamp 让第二次读取只 stat、不重读备份；坏文件不会在每次组装重复解析。
@@ -799,7 +819,7 @@ sequenceDiagram
   - 单测：node --test tests/layers.test.mjs tests/service.test.mjs
   - 客户端：node --test tests/client-index.test.mjs tests/dialog.test.mjs tests/locales.test.mjs
   - 全量：npm run check（build + typecheck + test）
-- 当前基线（2026-10-29）：typecheck 通过；测试 125 通过 / 1 跳过 / 0 失败。新增测试后要求 0 失败。
+- 当前基线（2026-10-29 审计后实测）：169 tests / 168 pass / 0 fail / 1 skip；以 `npm run check` 实测为准，新增测试后要求 0 失败。
 
 ### 8.4 真机验收清单
 
@@ -855,7 +875,7 @@ sequenceDiagram
 1. **阶段 1：存储模块 + 单测**。新增会话目录定位、文件读写、大小检查、读失败回退、备份写入、兜底与路径安全；只碰新模块和它的测试。
 2. **阶段 2：注册表 + 服务 + 接线 + 单测**。注册表改成先落盘再提交、按需读；服务增加错误映射；index 注入存储；更新现有层/服务/index 测试。
 3. **阶段 3：客户端水合 + 文案 + 单测**。dock 挂载即读、并发去重、失败重试；新增错误文案；更新客户端/弹窗/字典测试。
-4. **阶段 4：文档回写 + 版本 + 全量检查**。README、CHANGELOG、旧需求/设计档回写、版本 0.2.0；npm run check；真机验收准备；按 §10.2 去掉 .gitignore 的 docs/ 忽略并提交 docs（评审通过后执行）。
+4. **阶段 4：文档回写 + 版本 + 全量检查**。README、CHANGELOG、旧需求/设计档回写、版本 0.2.0（package.json 与 dsh.plugin.json 清单同步）；npm run check；真机验收准备；按 §10.2 去掉 .gitignore 的 docs/ 忽略并提交 docs（评审通过后执行）。
 
 ### 10.2 改动文件清单
 
@@ -872,6 +892,7 @@ sequenceDiagram
 | 修改 | src/client/locales.ts | layer-persist / layer-read-failed / layer-readonly / session-invalid 文案 |
 | 修改 | src/client/dialog.ts | 错误码到文案的映射（含 layer-read-failed） |
 | 修改 | package.json | 版本 0.2.0 |
+| 修改 | dsh.plugin.json | 版本 0.2.0（与 package.json 同步；插件清单是安装面看到的版本） |
 | 修改 | README.md | 持久化、文件位置、边界 |
 | 修改 | CHANGELOG.md | 0.2.0 条目 |
 | 修改 | .gitignore | 去掉 docs/ 忽略；文档脱敏后纳入 Git |
@@ -882,7 +903,7 @@ sequenceDiagram
 | 修改 | tests/service.test.mjs | await、新错误码 |
 | 修改 | tests/client-index.test.mjs | 挂载即读、并发合并、失败重试 |
 | 修改 | tests/dialog.test.mjs | 新错误码文案 |
-| 修改 | tests/locales.test.mjs | 新增 key 的 zh/en 对齐 |
+| 未改 | tests/locales.test.mjs | 通用 key 扫描已覆盖新增文案，本批无需逐 key 改动 |
 | 可能修改 | tests/bundle.test.mjs | 如果断言了 host 构建文件清单，加入新模块 |
 | 不改 | src/contract.ts | 线上 schema 不变 |
 | 不改 | lib/ | 由构建生成 |
@@ -904,7 +925,7 @@ sequenceDiagram
 ### 10.5 旧文档回写清单（实施阶段执行）
 
 - docs/requirements.md：S6（第 25 行，as-of 2026-10-29）、FR-6（第 39 行）、非目标第 5 条（第 59 行）、AC-7（第 71 行）；改语义并加一句“0.2 增量见本档”。
-- docs/design.md：开头三句话（第 4 行）、目标“重启清空”（第 30 行）、非目标（第 37 行）、生命周期（第 145-148 行）、内存 schema（第 236 行）、边界（第 318 行）、阶段 3（第 349 行）、风险（第 371 行）、chip 行（第 394 行）；加“0.2 增量见本档”。
+- docs/design.md：开头三句话（第 4 行）、§2 目标与非目标（第 24-39 行）、§5.2 系统层注册表（第 113 行）、§5.3 生命周期（第 147-153 行）、§5.4 RPC 方法表/快照/错误码（第 155 行）、§6.2 宿主内存 schema（第 243 行）、§9 边界（第 316 行）、§10 阶段 3（第 357 行）、§11 风险（第 371 行）、§12.3 chip 行（第 399 行）；加“0.2 增量见本档”。§5.2/§5.4 是 2026-10-29 审计补的锚点（M7）；行号只作 as-of。
 - README.md：第 5、11、31、38 行的“重启清空/不落盘”改为“按会话持久化、文件在会话目录”；补一句导出边界。
 - CHANGELOG.md：新增 0.2.0 条目。
 - 所有计数、版本、路径声明同批改；改后回读，确认没有替换字符。
@@ -918,7 +939,7 @@ sequenceDiagram
 | 读路径拖慢会话 | 大文件、重复解析、全量扫描 | stat 先行 + 1 MiB 上限 + 复合 stamp 缓存（含错误标记）+ 只扫项目目录 + 100ms 预算 |
 | 备份恢复增加 I/O | 最多多两次小读取（备/兜底） | 每个候选 1 MiB 上限；复合 stamp 防重复；计入 100ms 预算 |
 | 侧边栏不显示 | 插件抛错/阻塞事件循环 | 不在会话列表路径上；读路径零抛错；超大文件不读；客户端 ensure 不抛 |
-| 读路径写盘 | 隔离/修备份/清 .tmp | 读路径零写；只在用户写层时写 |
+| 读路径写盘 | 隔离/修备份/清 .tmp | 读路径本身不写；搬入（needsPromotion）与用户加/删层才写，且都走串行写任务 |
 | 读失败后立即加层 | 内容类允许覆盖（有意修复）；I/O 类拒绝写入 | 写前强制读；I/O 类报 layer-read-failed；内容类写新文件覆盖；测试覆盖 |
 | 往会话目录写未知文件被平台视为异常 | 平台报错或清理 | 平台源码明确认日志文件名、忽略其他文件；单测 + 真机验收；出问题可退回兜底目录（功能仍可用） |
 | Windows 文件替换/占用 | 改名失败 | 写失败报 layer-persist；不提交内存；重试 |
@@ -934,7 +955,7 @@ sequenceDiagram
 ## 12. 决策记录与已知取舍
 
 - 2026-10-29 用户裁决：层文件放在会话目录；本插件只负责这一处的读写，不与其他插件耦合；重启自动恢复；不想要就点 ×；不加“已恢复”标记；不加开关；先看文档，再走工程模式。
-- 2026-10-29 追加约束：读失败（不存在/格式错/超大/不可读）先试备份/兜底，都失败才按无文件回退；不影响会话或侧边栏；单会话新增开销 ≤ 100ms；读路径零写。
+- 2026-10-29 追加约束：读失败（不存在/格式错/超大/不可读）先试备份/兜底，都失败才按无文件回退；不影响会话或侧边栏；单会话新增开销 ≤ 100ms；读路径本身不写（AC-8 的搬入由注册表的串行写任务显式执行，不是读路径写）。
 - 失败分类：I/O 类且所有副本不可用 → 拒绝写入（layer-read-failed）；混合情形按 I/O 优先；内容类且无副本、且没有任何 I/O 错误 → 允许写新文件覆盖坏主文件（修复）；有可读副本时按副本继续；命中之后的 I/O 错误不阻止缓存，命中之前的错误置空重试；详见需求档 §8。
 - 已知取舍（不是开放项，评审时可提出）：
   1. 点 × 失败时不弹提示，标签留在原处作为反馈。

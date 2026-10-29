@@ -39,6 +39,10 @@ export const zh = {
   'dialog.staleSpan': '输入框在弹窗打开后变了，这次没有插入任何文字；关掉弹窗后重新输入 / 再选一次。',
   'dialog.running': '处理中…',
   'dialog.error': '操作失败：{message}',
+  'dialog.persistFailed': '没能保存到磁盘，这次没有加进去；磁盘上的旧内容没有变，可以再试一次。',
+  'dialog.readFailed': '读取会话层失败，这次没有写入；会话和侧边栏不受影响，稍后可以再试。',
+  'dialog.readOnly': '该会话的层文件由更新版本写入，当前只读，不能修改。',
+  'dialog.sessionInvalid': '这个会话的编号不合法，无法保存。',
 
   'chips.aria': '本会话系统提示词层',
   'chips.count': '系统层 {count} 条 · 每轮 +{tokens} tokens',
@@ -122,6 +126,10 @@ export const en = {
   'dialog.staleSpan': 'The composer changed while this dialog was open, so nothing was inserted. Close the dialog and pick again with /.',
   'dialog.running': 'Working…',
   'dialog.error': 'Failed: {message}',
+  'dialog.persistFailed': 'The layers could not be saved to disk, so nothing was added; the old content is unchanged, try again.',
+  'dialog.readFailed': 'The session layers could not be read, so nothing was written. The session and the sidebar are unaffected; try again later.',
+  'dialog.readOnly': 'This session layer file was written by a newer version; it is read-only.',
+  'dialog.sessionInvalid': 'This session id is not a valid layer-file name, so it cannot be saved.',
 
   'chips.aria': 'Session system-prompt layers',
   'chips.count': '{count} layer(s) · +{tokens} tokens per turn',

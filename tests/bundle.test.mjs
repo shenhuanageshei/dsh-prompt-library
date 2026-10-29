@@ -1,7 +1,8 @@
 /**
  * Build output contract (design D5: TypeScript + tsdown, replacing build.mjs):
  *   - `lib/index.js` is the host half: one ESM module per source file emitted by
- *     `tsc -p tsconfig.build.json`, entry exports name/inject/apply;
+ *     `tsc -p tsconfig.build.json` (0.2 adds host/layer-store.js), entry exports
+ *     name/inject/apply;
  *   - `lib/client.js` is one single-file `window.__ModuleLoader__.load`
  *     envelope emitted by tsdown whose factory requires only `react` and `zod`
  *     (no relative require), carries the inlined contract/token estimator, and
@@ -24,7 +25,7 @@ const host = await readFile(join(LIB, 'index.js'), 'utf8');
 const client = await readFile(join(LIB, 'client.js'), 'utf8');
 
 test('bundle: lib/ contains the host entry and the client bundle', async () => {
-  for (const relativePath of ['index.js', 'contract.js', 'host/store.js', 'host/layers.js', 'host/service.js', 'host/typert.js', 'shared/tokens.js', 'client.js']) {
+  for (const relativePath of ['index.js', 'contract.js', 'host/store.js', 'host/layers.js', 'host/layer-store.js', 'host/service.js', 'host/typert.js', 'shared/tokens.js', 'client.js']) {
     const info = await stat(join(LIB, relativePath));
     assert.equal(info.isFile(), true, 'lib/' + relativePath + ' must exist');
   }

@@ -54,23 +54,6 @@ function emptyLayerView() {
 }
 
 /**
- * Whether one finished layer read may keep its warm-up mark.
- *
- * The session-list subscription runs while `ctx.remote.$mount` is still in
- * flight on a fresh page load, so its first read answers
- * `remote-unavailable` without ever reaching the host. Marking that failure
- * as "already read" kept the session cold until the next reconnect (code-review
- * round 2, finding #1: after an F5 the host-held layers never appeared), so only
- * a successful read keeps the mark; a failed one forgets it and the next
- * session snapshot — or the post-mount sweep in the Remote effect — retries.
- * @param {{ok: boolean}|undefined} result - outcome of one `layers` read.
- * @returns {boolean} true when the session may stay marked as warmed.
- */
-function layerWarmupKept(result) {
-  return result?.ok === true;
-}
-
-/**
  * Project a host LibrarySnapshot into the client view.
  * @param {object} snapshot - wire snapshot.
  * @returns {object} client view.
@@ -104,7 +87,12 @@ export function apply(ctx) {
   const libraryStore = createClientStore(emptyLibraryView());
   const layerStores = new Map();
   const dialogStores = new Map();
+  /** Sessions whose layers were read successfully (skips a redundant read). */
   const layersReady = new Set();
+  /** `sessionId -> in-flight read` so concurrent ensures share one request. */
+  const oneFlight = new Map();
+  /** Connection generation: a reset discards results from the old connection. */
+  let epoch = 0;
 
   /** The mounted Remote namespace face (undefined until $mount settles). */
   let remote;
@@ -171,28 +159,66 @@ export function apply(ctx) {
     return result;
   };
 
-  /** Read one session's layers and publish them. */
+  /**
+   * Read one session's layers and publish them.
+   *
+   * The generation is captured before the call and re-checked before the store
+   * write: a response that arrives after `connection/reset` belongs to the old
+   * connection and must not overwrite the new state (design §5.6).
+   * @param {string} sessionId - session identity.
+   * @returns {Promise<object>} the normalized call outcome.
+   */
   const refreshLayers = async (sessionId) => {
-    const result = await call('layers', String(sessionId));
-    if (result.ok) {
-      layerStore(sessionId).set(result.value);
-      return { ok: true, value: result.value };
-    }
+    const key = String(sessionId);
+    const startedAt = epoch;
+    const result = await call('layers', key);
+    if (result.ok && startedAt === epoch) layerStore(key).set(result.value);
     return result;
   };
 
-  /** Ensure a session's layers are read at least once per mount (never from render). */
+  /**
+   * Ensure one session's layers are read (design §5.6 / FR-4).
+   *
+   * - a session that already read successfully is skipped;
+   * - a session with a read in flight reuses that promise (one request, not N);
+   * - a failure is NOT marked ready, so the next mount/ensure retries;
+   * - the returned promise never rejects (the caller is a React effect).
+   * @param {string|number} sessionId - session identity.
+   * @returns {Promise<{ok: boolean}>} the read outcome.
+   */
   const ensureLayers = (sessionId) => {
     const key = String(sessionId);
-    if (layersReady.has(key)) return;
-    layersReady.add(key);
-    void refreshLayers(sessionId).then((result) => {
-      // The very first read happens before `ctx.remote.$mount` settles, so it
-      // answers `remote-unavailable`; keeping the mark would make the session
-      // look "read" forever. Forget it and let the next snapshot retry
-      // (code-review round 2, finding #1).
-      if (!layerWarmupKept(result)) layersReady.delete(key);
-    });
+    if (layersReady.has(key)) return Promise.resolve({ ok: true });
+    const running = oneFlight.get(key);
+    if (running !== undefined) return running;
+    const startedAt = epoch;
+    const run = refreshLayers(key)
+      .then((result) => {
+        if (startedAt !== epoch) return result; // connection reset: drop the landing
+        if (result.ok) layersReady.add(key);
+        else layersReady.delete(key);
+        return result;
+      })
+      .catch((error) => {
+        console.error('[dsh-prompt-library] layer hydrate failed', key, error);
+        layersReady.delete(key);
+        return { ok: false, code: 'error', message: error instanceof Error ? error.message : String(error) };
+      })
+      .finally(() => {
+        if (oneFlight.get(key) === run) oneFlight.delete(key);
+      });
+    oneFlight.set(key, run);
+    return run;
+  };
+
+  /**
+   * Forget every hydrate mark and in-flight read (connection reset or unmount).
+   * @returns {void}
+   */
+  const resetLayerHydration = () => {
+    epoch += 1;
+    layersReady.clear();
+    oneFlight.clear();
   };
 
   /**
@@ -206,7 +232,7 @@ export function apply(ctx) {
   const warmSessionLayers = () => {
     const snapshot = sessions?.list?.getSnapshot();
     const ids = Array.isArray(snapshot?.ids) ? snapshot.ids : Object.keys(snapshot?.byId ?? {});
-    for (const id of ids) ensureLayers(id);
+    for (const id of ids) void ensureLayers(id);
   };
 
   /** Publish a library snapshot returned by a mutating call (design §5.5: a write invalidates the menu cache). */
@@ -333,11 +359,11 @@ export function apply(ctx) {
     // visited only stores that already existed, which after a client reload/F5
     // is none — the host-held layers never showed up (code-review round 2,
     // finding #1).
-    layersReady.clear();
+    resetLayerHydration();
     warmSessionLayers();
     return () => {
       remote = undefined;
-      layersReady.clear();
+      resetLayerHydration();
       void dispose();
     };
   }, 'dsh-prompt-library: remote');
@@ -357,7 +383,9 @@ export function apply(ctx) {
   // A reconnect rebuilds the host: drop caches and re-read.
   ctx.on('connection/reset', () => {
     invalidateSource();
-    layersReady.clear();
+    // A rebuilt host is a new generation: forget the hydrate marks and the reads
+    // still in flight, so their answers cannot land in the fresh state.
+    resetLayerHydration();
     // Re-read, then prewarm the menu cache from that same rebuild (round 1, finding #5).
     void refreshLibrary(false).then(() => source.warm());
     warmSessionLayers();
@@ -386,6 +414,18 @@ export function apply(ctx) {
     order: 30,
     locale: NS,
     inject: (sessionId) => ({
+      sessionId: String(sessionId),
+      // The dock reads its own session on mount (0.2 FR-4): a refresh no longer
+      // depends on the session list changing. Idempotent, and wrapped so even a
+      // synchronous surprise can never escape into the component render
+      // (design §5.6: "ensure 外层再包 try/catch").
+      ensure: () => {
+        try {
+          void ensureLayers(sessionId);
+        } catch (error) {
+          console.error('[dsh-prompt-library] layer ensure failed', sessionId, error);
+        }
+      },
       hooks: { layers: layerStore(sessionId) },
       openEditor: (promptId) => {
         void openLayerEditor(sessionId, promptId);

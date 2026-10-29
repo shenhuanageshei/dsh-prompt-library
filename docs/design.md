@@ -110,29 +110,29 @@
         writeFile(tmp, JSON.stringify(data, null, 2))
         rename(tmp, path)             # 原子替换
 
-### 5.2 系统层注册表（host，内存）
+### 5.2 系统层注册表（host；0.2 起内存视图 + 会话目录落盘）
 
-    layers = Map<sessionId, Layer[]>   # Layer: { promptId, title, body }
-    MAX = 3
+    0.2 起事实源是该会话目录里的层文件（LayerStore），进程内只是视图/缓存；
+    注册表只依赖 store 的 load / write 两个方法（未注入 store 时退化为 0.1 的纯内存行为）。
+    机制伪代码与前置/后条件见 0.2 设计档 §5.4；这里只列不变的产品语义。
 
-    addLayer(sid, layer):
-      list = layers.get(sid) ?? []
-      if existing = find(list, layer.promptId):
-        existing.title = layer.title
-        existing.body = layer.body          # 同 id 视为更新，不重复
-        return snapshot(sid)
-      if list.length >= MAX: throw LayerLimit
-      list.push(layer)
-      layers.set(sid, list)
-      return snapshot(sid)
-
-    removeLayer(sid, promptId): filter; return snapshot(sid)
+    addLayer / removeLayer / clear（串行队列，一次只落一条盘）:
+      ensureLoaded(sid, force=true)           # 写前强制读，绝不覆盖没看到的层
+      I/O 读失败退避中 → layer-read-failed     # 不可读时拒绝写入，不拿空内存覆盖磁盘
+      文件版本未知 → layer-readonly
+      同 promptId 更新原位置；第 4 条 → layer-limit
+      await store.write(next)                 # 落盘成功前不提交内存/界面
+      成功后 setRows；失败 → layer-persist，内存与界面保持旧值
 
     sectionText(agent):
-      if !agent: return ""                  # 非 agent 组装
-      list = layers.get(String(agent.session.id)) ?? []
-      if list.length === 0: return ""       # 空串 = 段落消失，零 token
+      if !agent: return ""                    # 非 agent 组装
+      ensureLoaded(String(agent.session.id))  # 读路径永不抛错；读失败按“没有这个文件”
+      list = rows(sid) ?? []
+      if list.length === 0: return ""          # 空串 = 段落消失，零 token
       return list.map(l => l.body).join("\n\n---\n\n")
+
+    读路径本身不写；读取返回 needsPromotion，注册表随后用串行写任务异步搬入兜底文件，
+    这是显式写，不是读路径写（0.2 设计档 D10、§5.4）。
 
 ### 5.3 系统提示词段（host）
 
@@ -158,13 +158,17 @@ DSH 进程重启后第一次使用该会话时从会话目录读回，chip 与�
       list(): LibrarySnapshot
       save(input: PromptInput): LibrarySnapshot      # id 空 = 新建
       removePrompt(id): LibrarySnapshot   # wire 名不能是 remove：与网关 RemoteNamespaceService.prototype.remove 冲突
-      layers(sessionId): LayerSnapshot
-      addLayer(sessionId, LayerInput): LayerSnapshot
-      removeLayer(sessionId, promptId): LayerSnapshot
-      clearLayers(sessionId): LayerSnapshot
+      layers(sessionId): LayerSnapshot                     # 0.2：每次按需读该会话层文件；读失败返回空快照
+      addLayer(sessionId, LayerInput): Promise<LayerSnapshot>      # 0.2：先落盘再提交（异步）
+      removeLayer(sessionId, promptId): Promise<LayerSnapshot>
+      clearLayers(sessionId): Promise<LayerSnapshot>
 
-    LayerSnapshot = { layers: [{ promptId, title, tokens }], totalTokens }
-    错误码：layer-limit / not-found / library-corrupt / stale-write
+    LayerSnapshot = { layers: [{ promptId, title, body, tokens }], totalTokens, limit }
+                    # 线上形状与 0.1 实现一致；契约不变（src/contract.ts）。
+                    # 本节顺带补上 0.1 文档漏写的 body / limit 两个字段。
+    提示词库错误码：not-found / library-corrupt / stale-write / library-full / input-invalid
+    层错误码（0.2）：layer-limit / layer-persist / layer-read-failed / layer-readonly / session-invalid
+    读失败不产生错误码：layers 一律返回空快照（0.2 设计档 §6.3）。
 
 ### 5.5 `/` 菜单来源（client）
 
@@ -259,7 +263,8 @@ DSH 进程重启后第一次使用该会话时从会话目录读回，chip 与�
     +---------------------------- DSH host ---------------------------- +
     |  dsh-prompt-library (lib/index.js)                                |
     |    PromptStore  <-- prompts.json ($DSH_HOME/prompt-library)       |
-    |    LayerRegistry (Map<sessionId, Layer[]>)                        |
+    |    LayerRegistry (内存视图) <--> LayerStore (0.2)                 |
+    |       LayerStore <--> 会话目录/prompt-library-layers.json          |
     |    systemPrompt.section(order 10500, text=layers(agent.session))  |
     |    Typert service promptLibrary  <-- RPC                          |
     +-------------------------------+----------------------------------+

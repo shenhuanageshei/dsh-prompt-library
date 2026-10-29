@@ -22,3 +22,5 @@ export const useState: any = (ReactRuntime as any).useState;
 export const useRef: any = (ReactRuntime as any).useRef;
 /** `React.useLayoutEffect`, bound once for the overlay measurement. */
 export const useLayoutEffect: any = (ReactRuntime as any).useLayoutEffect;
+/** `React.useEffect`, bound once for the dock's mount-time layer read. */
+export const useEffect: any = (ReactRuntime as any).useEffect;

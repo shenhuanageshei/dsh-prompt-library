@@ -15,7 +15,9 @@
  *     everything the user had typed);
  *   - with no span at all the body is appended at the draft end;
  *   - a failed layer write is rendered from its CODE, never from the host's
- *     English sentence (audit should-fix 9).
+ *     English sentence (audit should-fix 9) — including the four 0.2 persistence
+ *     codes layer-persist / layer-read-failed / layer-readonly / session-invalid
+ *     (0.2 design §6.3).
  *
  * NOTE: values that come back from the VM realm are compared field by field —
  * `assert.deepEqual` from `node:assert/strict` rejects cross-realm prototypes.
@@ -138,4 +140,18 @@ test('dialog: the layer-limit code is rendered as localized copy, not the host s
   assert.equal(dialogErrorText({ ok: false, code: 'input-invalid', message: 'bad body' }, t), 'T:dialog.error');
   assert.equal(dialogErrorText({ ok: false, message: 'boom' }, t), 'T:dialog.error');
   assert.equal(dialogErrorText(undefined, t), 'T:dialog.error');
+});
+
+test('dialog: the 0.2 persistence codes are rendered as localized copy too', () => {
+  const t = (key) => 'T:' + key;
+  assert.equal(
+    dialogErrorText({ ok: false, code: 'layer-persist', message: 'ENOSPC: no space left on device' }, t),
+    'T:dialog.persistFailed'
+  );
+  assert.equal(
+    dialogErrorText({ ok: false, code: 'layer-read-failed', message: 'EACCES: permission denied' }, t),
+    'T:dialog.readFailed'
+  );
+  assert.equal(dialogErrorText({ ok: false, code: 'layer-readonly', message: 'version 2' }, t), 'T:dialog.readOnly');
+  assert.equal(dialogErrorText({ ok: false, code: 'session-invalid', message: 'bad id' }, t), 'T:dialog.sessionInvalid');
 });

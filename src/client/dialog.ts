@@ -122,11 +122,17 @@ function planInsert(draft, draftRev, span, text) {
 /**
  * Localized text for one failed system-layer write.
  *
- * The host answers `layer-limit` when a fourth distinct layer is requested
- * (src/host/layers.js -> `LayerRegistry.add`). That message is English, and the
- * dialog renders whatever it is handed, so the CODE is mapped onto product copy
- * here rather than letting a host sentence appear inside a Chinese dialog
- * (design FR-8 — the Chinese dictionary is the copy of record).
+ * The host answers with a CODE and an English sentence
+ * (src/host/layers.ts -> `LayerRegistry` / src/host/layer-store.ts). The dialog
+ * renders whatever it is handed, so every code is mapped onto product copy here
+ * rather than letting a host sentence appear inside a Chinese dialog
+ * (0.2 design §6.3 — the Chinese dictionary is the copy of record):
+ *
+ *   layer-limit       a fourth distinct layer was refused;
+ *   layer-persist     the write (or its backup/rename) failed, disk unchanged;
+ *   layer-read-failed the layer file could not be read, so the write was refused;
+ *   layer-readonly    the file was written by a newer version;
+ *   session-invalid   the session id is not a safe layer-file name.
  * @param {{ok: false, code?: string, message?: string}} result - failed client call.
  * @param {(key: string, params?: object) => string} t - namespace translator.
  * @returns {string} the message to render.
@@ -134,6 +140,10 @@ function planInsert(draft, draftRev, span, text) {
 function dialogErrorText(result, t) {
   const code = typeof result?.code === 'string' ? result.code : '';
   if (code === 'layer-limit') return t('dialog.delivery.full');
+  if (code === 'layer-persist') return t('dialog.persistFailed');
+  if (code === 'layer-read-failed') return t('dialog.readFailed');
+  if (code === 'layer-readonly') return t('dialog.readOnly');
+  if (code === 'session-invalid') return t('dialog.sessionInvalid');
   return t('dialog.error', { message: typeof result?.message === 'string' ? result.message : '' });
 }
 

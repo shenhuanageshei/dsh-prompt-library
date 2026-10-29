@@ -4,10 +4,15 @@
  * Owns three things and nothing else:
  *   1. the prompt library file (`$DSH_HOME/prompt-library/prompts.json`, atomic
  *      write + backup + quarantine — src/host/store.js);
- *   2. the per-session system layers (process memory, max three —
- *      src/host/layers.js);
+ *   2. the per-session system layers (max three, persisted inside each
+ *      session's own directory — src/host/layers.js + src/host/layer-store.js);
  *   3. the `promptLibrary` Remote namespace (strict Typert manifest plus
  *      `@Remote` markers — src/host/service.js).
+ *
+ * 0.2 persistence (docs/2026-10-29-session-layer-persistence-design.md §5.5):
+ * the registry is constructed WITH a store, so the layers survive a DSH restart
+ * (read back on the first use of a session) and a browser refresh. The prompt
+ * section itself is unchanged: same name, same derived order, same callback.
  *
  * With no active layer the registered prompt section returns an empty string,
  * so an untouched session pays exactly zero extra tokens (AC-11).
@@ -17,6 +22,7 @@ import { z } from 'zod';
 import { defineContract } from './contract.js';
 import { PromptStore, resolveLibraryPath } from './host/store.js';
 import { LayerRegistry } from './host/layers.js';
+import { LayerStore } from './host/layer-store.js';
 import { PromptLibraryService } from './host/service.js';
 import { buildManifest } from './host/typert.js';
 
@@ -61,7 +67,10 @@ export function resolveSectionOrder(systemPrompt) {
 export function apply(ctx) {
   const contract = defineContract(z);
   const store = new PromptStore({ filePath: resolveLibraryPath(process.env, homedir()), contract });
-  const layers = new LayerRegistry({ contract });
+  // 0.2: the layers live in each session's own directory (design §4.1). The
+  // store resolves $DSH_HOME itself, exactly like the prompt library above.
+  const layerStore = new LayerStore({ contract });
+  const layers = new LayerRegistry({ contract, store: layerStore });
   const service = new PromptLibraryService(ctx, { store, layers, contract });
 
   // Strict endpoint registration: the gateway resolves promptLibrary/* from this
@@ -95,8 +104,9 @@ export function apply(ctx) {
     }
   });
 
-  // Layer lifetime (design §5.3, §9). The registry is process memory keyed by
-  // session id, and NOTHING on the agent lifecycle may clear it:
+  // Layer lifetime (0.2 design §5.4, §9; 0.1 design §5.3). The registry is keyed
+  // by session id and, since 0.2, backed by the session's own layer file, so the
+  // layers survive a restart. NOTHING on the agent lifecycle may clear it:
   //
   //   - `agent/disposed` fires on every agent teardown, i.e. BETWEEN a user's
   //     two messages and on every compaction. Clearing there made a layer
@@ -114,10 +124,12 @@ export function apply(ctx) {
   //     lists exactly those four) — there is no true session-close event to
   //     hook instead.
   //
-  // So a layer lives until the DSH process restarts, or until the user removes
-  // it through the Remote (`removeLayer` / `clearLayers`) — which is exactly
-  // the requirements' contract: per-process, never persisted, user-owned off
-  // switch. Do not reintroduce an agent/session teardown clear here.
+  // So a layer lives until the user removes it through the Remote
+  // (`removeLayer` / `clearLayers`), which writes the empty state to the session
+  // directory and is the user-owned off switch (0.2 requirements FR-2, S3).
+  // Do not reintroduce an agent/session teardown clear here: a teardown would
+  // merely force a re-read, and with a broken layer file it would silently
+  // change what the next assembly injects.
 
   // Kept for the client's post-restart sanity read and for debugging.
   service.libraryPath = store.filePath;
