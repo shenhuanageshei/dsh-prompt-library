@@ -395,6 +395,7 @@ DSH 进程重启后第一次使用该会话时从会话目录读回，chip 与�
 - 系统层已有 2 条时，选系统层显示“会再加一条，每轮约 +X tokens”。
 - 已满 3 条：系统层选项禁用，提示“先关一条”。
 - 弹窗在**会话内容区**内居中（左右侧栏展开时也不覆盖侧栏）；内容区不足时宽度收缩并保留 ≥16px 边距。
+- **定位按实测走，不按视口算术**（0.2.1，2026-11-06 真机缺陷）。DSH 0.2.2 的 composer 座位在 `[data-phase=active]` 下带 `will-change: transform`（`@deepseek-ai/dsh-client-ui-conversation/lib/client.js` 的 ConversationRoot 样式），该属性会给 `position: fixed` 后代生成**包含块**；旧实现把视口坐标直接写成 `left/top`，于是被当成「相对座位」的坐标，弹窗整体漂到输入框下方、背景又按内容区高度铺开，会话被盖住。现实现：量一次自身与内容区的真实矩形 → 由 `measured.width / frame.width` 求本地缩放、由两个矩形之差求偏移 → 回填 CSS 帧，最多 3 趟（第 2 趟吸收「fixed 后代计入滚动容器可滚动溢出」造成的滚动条位移）。见 `src/client/dialog.ts` 的 `frameFromMeasurement` / `placeOverlay`；纯函数用例在 `tests/dialog.test.mjs` 的 placement 组，DOM 半部在真机浏览器复刻页验证。重算时机：挂载后的下一帧、内容区 `ResizeObserver`、窗口 `resize`、内容区滚动（按帧合并）、相位过渡的 `transitionend`/`animationend`、以及 `data-phase` / `data-content-phase` 翻转（`MutationObserver`，属性名消失时只是少一次重算，不会报错）。
 
 ### 12.3 chips
 

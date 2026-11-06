@@ -98,17 +98,23 @@ const cssText = `
   font-size: 11px;
 }
 
-/* Modal backdrop (design §12.2). inset: 0 is only the FALLBACK: the dialog
- * measures the conversation content area at open and passes its box as the
- * inline left/top/width/height (dialog.js -> useConversationFrame), so the
- * backdrop is pinned between the side panels instead of covering the viewport
- * and the dialog centres inside the conversation column. The 16px padding is
- * the promised minimum margin: on a narrow content area the dialog shrinks
- * (width: min(680px, 100%)) and keeps 16px on every side. */
+/* Modal backdrop (design §12.2). inset: 0 is only what paints before the
+ * first measurement: the dialog measures itself plus the conversation content
+ * area and writes the resulting left/top/width/height inline
+ * (dialog.js -> placeOverlay). Measuring is not optional — the composer
+ * subtree generates a CONTAINING BLOCK for fixed descendants in DSH 0.2.2
+ * (will-change: transform on .an3WzG_composerSeat), so viewport arithmetic
+ * would drop the dialog under the input box instead of over the conversation.
+ * visibility: visible below keeps the modal painted when the platform hides
+ * the composer mid-animation ([data-phase=settling] sets visibility:hidden on
+ * the seat; visibility is inherited, but a descendant may override it).
+ * The 16px padding is the promised minimum margin: on a narrow content area
+ * the dialog shrinks (width: min(680px, 100%)) and keeps 16px on every side. */
 .dsh_promptLibrary_backdrop {
   position: fixed;
   inset: 0;
   z-index: 1200;
+  visibility: visible;
   box-sizing: border-box;
   display: flex;
   align-items: center;

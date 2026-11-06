@@ -32,11 +32,11 @@ const source = await transpileClientModule('dialog');
 const sandbox = { console };
 vm.createContext(sandbox);
 vm.runInContext(
-  `${source}\n;globalThis.__dialogHelpers = { planInsert, promptDialogKey, dialogErrorText };`,
+  `${source}\n;globalThis.__dialogHelpers = { planInsert, promptDialogKey, dialogErrorText, frameFromMeasurement, frameSettled };`,
   sandbox,
   { filename: 'src/client/dialog.ts' }
 );
-const { planInsert, promptDialogKey, dialogErrorText } = sandbox.__dialogHelpers;
+const { planInsert, promptDialogKey, dialogErrorText, frameFromMeasurement, frameSettled } = sandbox.__dialogHelpers;
 
 /** One stored pick span. */
 function spanOf(start, end, draftRev) {
@@ -154,4 +154,87 @@ test('dialog: the 0.2 persistence codes are rendered as localized copy too', () 
   );
   assert.equal(dialogErrorText({ ok: false, code: 'layer-readonly', message: 'version 2' }, t), 'T:dialog.readOnly');
   assert.equal(dialogErrorText({ ok: false, code: 'session-invalid', message: 'bad id' }, t), 'T:dialog.sessionInvalid');
+});
+
+// ---------------------------------------------------------------------------
+// Backdrop placement (0.2.1): DSH 0.2.2 gives the composer seat
+// `will-change: transform`, which makes it the containing block of our
+// `position: fixed` backdrop — viewport coordinates written as left/top then
+// land under the input box (live defect 2026-11-06). The frame is therefore
+// DERIVED from one measurement, never from viewport arithmetic. These cases are
+// the pure half of that derivation; the DOM half is verified in a real browser.
+// ---------------------------------------------------------------------------
+
+/** One box in the helper's shape. */
+function box(left, top, width, height) {
+  return { left, top, width, height };
+}
+
+test('placement: a viewport-sized containing block is a straight copy', () => {
+  const next = frameFromMeasurement(box(0, 0, 800, 600), box(0, 0, 800, 600), box(120, 40, 800, 600));
+  assert.equal(next.left, 120);
+  assert.equal(next.top, 40);
+  assert.equal(next.width, 800);
+  assert.equal(next.height, 600);
+});
+
+test('placement: an offset containing block (composer seat) is compensated, not added', () => {
+  // The seat sits at (240, 712) in viewport px; the probe named left/top 0 and
+  // still measured there. The frame must subtract that origin.
+  const next = frameFromMeasurement(box(0, 0, 824, 805), box(240, 712, 824, 805), box(240, 0, 824, 805));
+  assert.equal(next.left, 0);
+  assert.equal(next.top, -712);
+  assert.equal(next.width, 824);
+  assert.equal(next.height, 805);
+});
+
+test('placement: a scaled containing block divides the frame by the measured scale', () => {
+  // scale(0.8) ancestor: a 1000x1000 CSS probe measures 800x800.
+  const next = frameFromMeasurement(box(0, 0, 1000, 1000), box(0, 0, 800, 800), box(0, 0, 640, 640));
+  assert.equal(next.left, 0);
+  assert.equal(next.top, 0);
+  assert.equal(next.width, 800);
+  assert.equal(next.height, 800);
+});
+
+test('placement: a partially applied frame is corrected from wherever it is', () => {
+  const next = frameFromMeasurement(box(10, 20, 100, 50), box(110, 120, 100, 50), box(60, 80, 100, 50));
+  assert.equal(next.left, -40);
+  assert.equal(next.top, -20);
+  assert.equal(next.width, 100);
+  assert.equal(next.height, 50);
+});
+
+test('placement: the correction is idempotent once the box is where it belongs', () => {
+  const target = box(240, 0, 824, 805);
+  const settled = box(0, -712, 824, 805);
+  const again = frameFromMeasurement(settled, box(240, 0, 824, 805), target);
+  assert.equal(again.left, settled.left);
+  assert.equal(again.top, settled.top);
+  assert.equal(again.width, settled.width);
+  assert.equal(again.height, settled.height);
+});
+
+test('placement: unusable measurements return null instead of a broken frame', () => {
+  const ok = box(0, 0, 800, 600);
+  assert.equal(frameFromMeasurement(null, ok, ok), null);
+  assert.equal(frameFromMeasurement(ok, null, ok), null);
+  assert.equal(frameFromMeasurement(ok, ok, null), null);
+  assert.equal(frameFromMeasurement(box(0, 0, 0, 600), ok, ok), null, 'a zero-width frame cannot be measured');
+  assert.equal(frameFromMeasurement(ok, box(0, 0, 0, 600), ok), null, 'a zero-width probe hides the scale');
+  assert.equal(frameFromMeasurement(ok, ok, box(0, 0, 0, 600)), null, 'a zero-width target is not a box');
+  assert.equal(frameFromMeasurement(ok, ok, box(0, 0, 800, NaN)), null);
+  assert.equal(frameFromMeasurement(box(0, 0, NaN, 600), ok, ok), null);
+  assert.equal(frameFromMeasurement('nope', ok, ok), null);
+});
+test('placement: the settle test ends the passes at sub-pixel agreement only', () => {
+  const frame = box(0, -712, 824, 805);
+  assert.equal(frameSettled(frame, box(0, -712, 824, 805)), true, 'identical frames are settled');
+  assert.equal(frameSettled(frame, box(0.4, -711.6, 824.4, 804.6)), true, 'sub-pixel noise is settled');
+  assert.equal(frameSettled(frame, box(0.6, -712, 824, 805)), false, 'a >0.5px horizontal move is not settled');
+  assert.equal(frameSettled(frame, box(0, -712.6, 824, 805)), false, 'a >0.5px vertical move is not settled');
+  assert.equal(frameSettled(frame, box(0, -712, 824.6, 805)), false, 'a >0.5px width change is not settled');
+  assert.equal(frameSettled(frame, box(0, -712, 824, 805.6)), false, 'a >0.5px height change is not settled');
+  assert.equal(frameSettled(null, frame), false);
+  assert.equal(frameSettled(frame, null), false);
 });
